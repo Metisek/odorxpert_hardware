@@ -30,6 +30,8 @@ Adafruit_SGP30 sgp;
 
 Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
 
+bool screenNeedsUpdate = true;
+
 // 📶 ================== KONFIGURACJA BLE ========================
 static const char* DEVICE_NAME = "MY_DEVICE_SIGNATURE";
 static BLEUUID serviceUUID("0000abcd-0000-1000-8000-00805f9b34fb");
@@ -60,7 +62,8 @@ enum MeasState : uint8_t {
 
 //  ================== STAN ENKODERA ===========================
 
-volatile int encoderPos = 0;
+volatile int encoderDelta = 0;        // Zmiana względna
+volatile int lastClkState = HIGH;     // Poprzedni stan CLK
 volatile bool buttonPressed = false;
 volatile unsigned long lastEncoderInterrupt = 0;
 volatile unsigned long lastButtonInterrupt = 0;
@@ -69,17 +72,20 @@ volatile unsigned long lastButtonInterrupt = 0;
 
 void IRAM_ATTR handleEncoder() {
   unsigned long now = millis();
-  if (now - lastEncoderInterrupt < 3) return; // debounce
+  if (now - lastEncoderInterrupt < 3) return;
 
   int clkState = digitalRead(ENC_CLK);
   int dtState = digitalRead(ENC_DT);
 
-  if (dtState != clkState) {
-    encoderPos++;
-  } else {
-    encoderPos--;
+  if (clkState != lastClkState) {
+    if (dtState != clkState) {
+      encoderDelta++;
+    } else {
+      encoderDelta--;
+    }
   }
-
+  
+  lastClkState = clkState;
   lastEncoderInterrupt = now;
 }
 
@@ -88,6 +94,15 @@ void IRAM_ATTR handleButton() {
   if (now - lastButtonInterrupt < 300) return; // debounce
   buttonPressed = true;
   lastButtonInterrupt = now;
+}
+
+// Funkcja pomocnicza do odczytu zmian
+int getEncoderDelta() {
+  noInterrupts();
+  int delta = encoderDelta;
+  encoderDelta = 0;
+  interrupts();
+  return delta;
 }
 
 void encoder_setup() {
@@ -108,6 +123,16 @@ Sample measurementResult;                // Wynik końcowy (dla wyświetlacza)
 unsigned long tState = 0;                // Czas zmiany stanu
 bool bigChange = false;                  // Flaga dużej zmiany
 
+// ================== ZMIENNE INTERFEJSU =======================
+unsigned long logoStartTime;
+bool inSubMenu = false;
+int currentMenu = 0;
+const char* menuItems[] = {"Live Measurement", "History"};
+int historySelection = 0;
+int lastHistoryPos = 0;
+unsigned long lastDisplayUpdate = 0;
+MeasState lastMeasurementState = IDLE;
+Sample lastSample = {0};
 
 // 📈 ================== HISTORIA POMIARÓW =======================
 struct Record { 
@@ -216,7 +241,15 @@ class ChCb : public BLECharacteristicCallbacks {
       measurementState = PREP; 
       tState = millis(); 
       bigChange = false;
-      baseline = currentMeasurement;  // Użyj ostatniego pomiaru
+      baseline = currentMeasurement;
+    
+      // Automatyczne przejście do ekranu pomiaru
+      if (!inSubMenu || currentMenu != 0) {
+        currentMenu = 0;
+        inSubMenu = true;
+        screenNeedsUpdate = true;
+      }
+      
       sendStatus();
     }
     else if(strcmp(req, "checkMeasurement") == 0) {
@@ -364,6 +397,8 @@ bool isBigChange(const Sample& base, const Sample& current) {
 void measurementTick() {
   static unsigned long lastRead = 0;
   const unsigned long READ_INTERVAL = 20;  // 50Hz
+  pinMode(ANALOG_PIN, INPUT); // Dodajemy inicjalizację ADC
+  lastClkState = digitalRead(ENC_CLK); // Inicjalizacja stanu 
   
   if(millis() - lastRead < READ_INTERVAL) return;
   lastRead = millis();
@@ -432,17 +467,6 @@ void measurementProcess() {
   }
 }
 
-// ================== ZMIENNE INTERFEJSU =======================
-unsigned long logoStartTime;
-bool inSubMenu = false;
-int currentMenu = 0;
-const char* menuItems[] = {"Live Measurement", "History"};
-int historySelection = 0;
-int lastHistoryPos = 0;
-unsigned long lastDisplayUpdate = 0;
-MeasState lastMeasurementState = IDLE;
-Sample lastSample = {0};
-
 // ================== FUNKCJE INTERFEJSU =======================
 void drawCenteredLogo() {
   int startX = (240 - odor_w) / 2;
@@ -478,9 +502,10 @@ void drawMainMenu() {
 
 void handleMenuAction() {
   inSubMenu = true;
+  screenNeedsUpdate = true;
   switch(currentMenu) {
     case 0: // Live Measurement
-      measurementState = IDLE;
+      measurementState = PREP;
       lastMeasurementState = IDLE;
       drawLiveMeasurementScreen();
       break;
@@ -500,6 +525,15 @@ void drawLiveMeasurementScreen() {
   }
 
   tft.setFont(&FreeSansBold18pt7b);
+
+  // Dodaj ADC value w prawym górnym rogu
+  int adcValue = analogRead(ANALOG_PIN);
+  tft.setFont();
+  tft.setTextSize(1);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setCursor(200, 10);
+  tft.print("ADC:");
+  tft.print(adcValue);
   
   // Stan pomiaru
   const char* stateText = "";
@@ -611,23 +645,34 @@ void loop() {
     lastTick = millis();
   }
 
-  // Obsługa enkodera
-  static int lastEncoderPos = 0;
-  if (lastEncoderPos != encoderPos) {
-    lastEncoderPos = encoderPos;
-    
+  // Nowa obsługa enkodera:
+  int delta = getEncoderDelta();
+  if (delta != 0) {
     if (!inSubMenu) {
-      currentMenu = (currentMenu + 1) % 2;
-      drawMainMenu();
-    } 
-    else if (inSubMenu && currentMenu == 1) {
-      int diff = encoderPos - lastHistoryPos;
-      if (diff != 0 && fifoCnt > 0) {
-        historySelection = constrain(historySelection + diff, 0, fifoCnt - 1);
-        lastHistoryPos = encoderPos;
-        drawHistoryScreen();
+      currentMenu = (currentMenu + delta) % 2;
+      if (currentMenu < 0) currentMenu = 1;
+      screenNeedsUpdate = true;
+    } else if (inSubMenu && currentMenu == 1) {
+      if (fifoCnt > 0) {
+        historySelection = (historySelection + delta) % fifoCnt;
+        if (historySelection < 0) historySelection = fifoCnt - 1;
+        screenNeedsUpdate = true;
       }
     }
+  }
+
+
+    // Sprawdzanie czy wymagana aktualizacja ekranu
+  if (screenNeedsUpdate) {
+    if (!inSubMenu) {
+      drawMainMenu();
+    } else if (currentMenu == 0) {
+      drawLiveMeasurementScreen();
+    } else if (currentMenu == 1) {
+      drawHistoryScreen();
+    }
+    screenNeedsUpdate = false;
+    lastDisplayUpdate = millis();
   }
 
   // Obsługa przycisku
@@ -636,7 +681,6 @@ void loop() {
     
     if (inSubMenu) {
       inSubMenu = false;
-      measurementState = IDLE;
       sendStatus();
       drawMainMenu();
     } else {
